@@ -1,0 +1,465 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Install libraries
+
+```{r}
+suppressPackageStartupMessages({
+  library(DBI)
+  library(RPostgres)
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(tidyr)
+  library(jsonlite)
+  library(stringi)
+  library(glue)
+  library(readr)
+  library(tibble)
+  library(dplyr)
+})
+
+```
+
+
+# Get reddit data from postgres
+
+```{r}
+# connect to postgres
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = Sys.getenv("DB_HOST"),
+  port = as.integer(Sys.getenv("DB_PORT", "5432")),
+  dbname = Sys.getenv("DB_NAME"),
+  user = Sys.getenv("DB_USER"),
+  password = Sys.getenv("DB_PASS"),
+  sslmode = "require"
+)
+
+# read in data
+reddit <- dbGetQuery(con, "SELECT * FROM clean_data.reddit")
+
+```
+
+# Helper functions to normalize text columns
+
+```{r}
+normalize_text <- function(x) {
+  x <- dplyr::coalesce(as.character(x), "")
+  x <- iconv(x, to = "UTF-8", sub = "")
+  x <- stringi::stri_trans_general(x, "Latin-ASCII")
+  x <- tolower(x)
+  x <- str_replace_all(x, "[|,/;]+", " ")
+  x <- str_replace_all(x, "#", " ")
+  x <- str_replace_all(x, "[^a-z0-9 ]+", " ")
+  x <- str_squish(x)
+  x
+}
+
+normalize_compact <- function(x) {
+  x <- normalize_text(x)
+  x <- str_replace_all(x, "\\s+", "")
+  x
+}
+
+clean_code <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+  x[x %in% c("", "\\N", "-", "N/A", "NA", "NULL", "null")] <- NA_character_
+  x
+}
+
+
+```
+
+# Blacklist / glue words
+
+```{r}
+bad_single_word_terms <- c(
+  "nice", "reading", "allen", "tours", "lot", "can", "for", "hear",
+  "same", "man", "part", "make", "date", "side", "tour", "travel",
+  "terminal", "flight", "flights", "airport", "airline", "airlines",
+  "airways", "city", "holiday", "vacation", "adventure", "sale", 
+  "surprise", "forest", "david", "forest", "bend", "most", "normal"
+)
+
+travel_glue_words <- c(
+  "travel", "tourism", "tourist", "trip", "trips", "vacation", "vacations",
+  "holiday", "holidays", "visit", "visiting", "guide", "guides",
+  "adventure", "adventures", "explore", "exploring", "destination",
+  "destinations", "getaway", "getaways", "journey", "journeys"
+)
+
+travel_glue_words <- unique(normalize_compact(travel_glue_words))
+```
+
+# reference builders
+```{r}
+build_airport_terms_strict <- function(airports) {
+  airports %>%
+    transmute(
+      type = "airport",
+      canonical_id = as.character(id),
+      canonical = as.character(name),
+      term_raw = as.character(name)
+    ) %>%
+    filter(
+      !is.na(term_raw),
+      str_squish(term_raw) != "",
+      str_detect(normalize_text(term_raw), "\\b(airport|airfield|heliport|aerodrome)\\b")
+    ) %>%
+    distinct(type, canonical_id, canonical, term_raw)
+}
+
+build_airline_terms_strict <- function(airlines) {
+  airlines %>%
+    mutate(
+      active = as.character(active),
+      name = as.character(name)
+    ) %>%
+    filter(is.na(active) | active == "Y") %>%
+    transmute(
+      type = "airline",
+      canonical_id = as.character(airline_id),
+      canonical = name,
+      term_raw = name
+    ) %>%
+    filter(
+      !is.na(term_raw),
+      str_squish(term_raw) != "",
+      nchar(str_squish(term_raw)) >= 6
+    ) %>%
+    distinct(type, canonical_id, canonical, term_raw)
+}
+
+build_city_terms_strict <- function(cities, min_population = 100000) {
+  cities %>%
+    mutate(
+      population = suppressWarnings(as.numeric(population)),
+      feature_code = as.character(feature_code),
+      name = as.character(name),
+      asciiname = as.character(asciiname)
+    ) %>%
+    filter(
+      feature_code %in% c("PPLC", "PPLA", "PPLA2", "PPLA3", "PPLA4") |
+        (!is.na(population) & population >= min_population)
+    ) %>%
+    transmute(
+      type = "city",
+      canonical_id = as.character(geonameid),
+      canonical = as.character(name),
+      term_list = map2(
+        name, asciiname,
+        function(name, asciiname) {
+          vals <- c(name, asciiname)
+          vals <- vals[!is.na(vals)]
+          vals <- str_trim(vals)
+          vals[vals != ""]
+        }
+      )
+    ) %>%
+    tidyr::unnest(term_list) %>%
+    rename(term_raw = term_list) %>%
+    mutate(
+      term_norm = normalize_text(term_raw),
+      is_bad_single = term_norm %in% bad_single_word_terms
+    ) %>%
+    filter(term_norm != "", !is_bad_single) %>%
+    select(type, canonical_id, canonical, term_raw) %>%
+    distinct(type, canonical_id, canonical, term_raw)
+}
+
+build_country_terms_strict <- function(countries) {
+  countries %>%
+    transmute(
+      type = "country",
+      canonical_id = as.character(Name),
+      canonical = as.character(Name),
+      term_raw = as.character(Name)
+    ) %>%
+    mutate(term_norm = normalize_text(term_raw)) %>%
+    filter(
+      !is.na(term_raw),
+      str_squish(term_raw) != "",
+      term_norm != "",
+      !(term_norm %in% bad_single_word_terms)
+    ) %>%
+    select(type, canonical_id, canonical, term_raw) %>%
+    distinct(type, canonical_id, canonical, term_raw)
+}
+
+build_ref_tbl_strict <- function(airports, airlines, cities, countries,
+                                 min_city_population = 100000) {
+  bind_rows(
+    build_airport_terms_strict(airports),
+    build_airline_terms_strict(airlines),
+    build_city_terms_strict(cities, min_population = min_city_population),
+    build_country_terms_strict(countries)
+  ) %>%
+    mutate(
+      type = as.character(type),
+      canonical_id = as.character(canonical_id),
+      canonical = str_squish(as.character(canonical)),
+      term_raw = str_squish(as.character(term_raw)),
+      term_norm = normalize_text(term_raw),
+      term_compact = normalize_compact(term_raw),
+      n_words = if_else(term_norm == "", 0L, str_count(term_norm, "\\S+"))
+    ) %>%
+    filter(!is.na(term_raw), term_norm != "", term_compact != "") %>%
+    distinct(type, canonical_id, canonical, term_raw, term_norm, term_compact, .keep_all = TRUE)
+}
+
+
+build_geo_lookup <- function(ref_tbl, max_phrase_words = 4L) {
+  ref_tbl <- ref_tbl %>%
+    mutate(
+      n_words = as.integer(n_words),
+      term_norm = as.character(term_norm),
+      term_compact = as.character(term_compact)
+    )
+
+  # exact token / phrase lookup
+  exact_lookup <- split(ref_tbl, ref_tbl$term_norm)
+
+  # compact lookup for glued forms
+  glued_lookup <- ref_tbl %>%
+    filter(type %in% c("city", "country")) %>%
+    split(.$term_compact)
+
+  # valid ngram sizes actually present
+  phrase_sizes <- sort(unique(ref_tbl$n_words))
+  phrase_sizes <- phrase_sizes[phrase_sizes >= 1L & phrase_sizes <= max_phrase_words]
+
+  list(
+    exact_lookup = exact_lookup,
+    glued_lookup = glued_lookup,
+    phrase_sizes = phrase_sizes,
+    glue_words = travel_glue_words
+  )
+}
+```
+
+#extract geo tags function
+```{r}
+extract_geo_tags_one_fast <- function(text_vec, lookup) {
+  text_vec <- text_vec[!is.na(text_vec)]
+  text_vec <- as.character(text_vec)
+  text_vec <- text_vec[nzchar(text_vec)]
+
+  if (length(text_vec) == 0) return("[]")
+
+  text_norm <- normalize_text(paste(text_vec, collapse = " "))
+  if (!nzchar(text_norm)) return("[]")
+
+  tokens <- unlist(str_split(text_norm, "\\s+"), use.names = FALSE)
+  tokens <- tokens[nzchar(tokens)]
+
+  if (length(tokens) == 0) return("[]")
+
+  hits <- list()
+  hit_i <- 0L
+
+  # 1) exact single-token and phrase matching
+  for (k in lookup$phrase_sizes) {
+    if (length(tokens) < k) next
+
+    grams <- if (k == 1L) {
+      tokens
+    } else {
+      vapply(
+        seq_len(length(tokens) - k + 1L),
+        function(i) paste(tokens[i:(i + k - 1L)], collapse = " "),
+        character(1)
+      )
+    }
+
+    grams_u <- unique(grams)
+    grams_hit <- grams_u[grams_u %in% names(lookup$exact_lookup)]
+
+    if (length(grams_hit) > 0) {
+      for (g in grams_hit) {
+        rows <- lookup$exact_lookup[[g]]
+        hit_i <- hit_i + 1L
+        hits[[hit_i]] <- rows
+      }
+    }
+  }
+
+  # 2) glued token matching like italytravel
+  token_compact <- str_replace_all(tokens, "\\s+", "")
+  token_compact <- unique(token_compact)
+
+  for (tok in token_compact) {
+    for (glue in lookup$glue_words) {
+      stem <- NULL
+
+      if (startsWith(tok, glue) && nchar(tok) > nchar(glue)) {
+        stem <- substr(tok, nchar(glue) + 1L, nchar(tok))
+      } else if (endsWith(tok, glue) && nchar(tok) > nchar(glue)) {
+        stem <- substr(tok, 1L, nchar(tok) - nchar(glue))
+      }
+
+      if (!is.null(stem) && nzchar(stem) && stem %in% names(lookup$glued_lookup)) {
+        rows <- lookup$glued_lookup[[stem]]
+        hit_i <- hit_i + 1L
+        hits[[hit_i]] <- rows
+      }
+    }
+  }
+
+  if (length(hits) == 0) return("[]")
+
+  matches <- bind_rows(hits) %>%
+    distinct(type, canonical_id, canonical, term_raw, .keep_all = TRUE)
+
+  out <- matches %>%
+    transmute(
+      type = type,
+      match = term_raw,
+      canonical = canonical,
+      id = canonical_id
+    ) %>%
+    arrange(type, canonical, match)
+
+  jsonlite::toJSON(out, auto_unbox = TRUE)
+}
+```
+
+# function to apply matching to df
+```{r}
+extract_geo_tags_df_fast <- function(df, lookup, text_cols, out_col = "geo_tag") {
+  vals <- apply(df[, text_cols, drop = FALSE], 1, function(x) {
+    extract_geo_tags_one_fast(x, lookup)
+  })
+
+  df[[out_col]] <- unname(vals)
+  df
+}
+```
+
+# Config
+
+```{r}
+# geo files
+airports  <- read.csv("geo_datasets/airports.csv", stringsAsFactors = FALSE)
+airlines  <- read.csv("geo_datasets/airlines.csv", stringsAsFactors = FALSE)
+cities    <- read.csv("geo_datasets/cities.csv", stringsAsFactors = FALSE)
+countries <- read.csv("geo_datasets/countries.csv", stringsAsFactors = FALSE)
+
+# parameters
+TEXT_COLS <- c("subreddit","body","title", "self_text","link_flair_text","full_text")
+out_dir <- "reddit_geotagged_parts"
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+# build reference and lookup tables
+```{r}
+# build reference table once
+ref_tbl <- build_ref_tbl_strict(
+  airports = airports,
+  airlines = airlines,
+  cities = cities,
+  countries = countries,
+  min_city_population = 50000
+)
+
+# build lookup once
+geo_lookup <- build_geo_lookup(ref_tbl)
+
+```
+
+# Split the reddit dataframe & ref table
+
+```{r}
+# split
+reddit_split <- split(reddit, reddit$subreddit)
+
+data.frame(
+  subreddit = names(reddit_split),
+  row_count = sapply(reddit_split, nrow)
+)
+```
+
+# Run chunk by chunk
+
+```{r}
+for (sub_name in names(reddit_split)) {
+  safe_name <- gsub("[^A-Za-z0-9_-]+", "_", sub_name)
+  out_file <- file.path(out_dir, paste0(safe_name, "_geotagged.csv"))
+
+  if (file.exists(out_file)) {
+    message("Skipping already finished: ", sub_name)
+    next
+  }
+
+  message("Working on: ", sub_name)
+
+  df <- reddit_split[[sub_name]]
+  if (is.null(df) || nrow(df) == 0) next
+
+  df <- extract_geo_tags_df_fast(
+    df = df,
+    lookup = geo_lookup,
+    text_cols = TEXT_COLS,
+    out_col = "geo_tag"
+  )
+
+  write_csv(df, out_file)
+  message("Saved: ", out_file)
+}
+```
+
+# Recombine the files
+
+```{r}
+part_files <- list.files(
+  out_dir,
+  pattern = "_geotagged\\.csv$",
+  full.names = TRUE
+)
+
+reddit_geotagged <- purrr::map_dfr(part_files, readr::read_csv, show_col_types = FALSE)
+
+```
+
+# Push data back to postgres
+
+```{r mongo-query}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = Sys.getenv("DB_HOST"),
+  port = as.integer(Sys.getenv("DB_PORT", "5432")),
+  dbname = Sys.getenv("DB_NAME"),
+  user = Sys.getenv("DB_USER"),
+  password = Sys.getenv("DB_PASS"),
+  sslmode = "require" 
+)
+
+# sanity check
+dbGetQuery(con, "select now() as now_utc;")
+```
+
+``` {r}
+schema_name <- "clean_data"
+table_name  <- "reddit"    
+
+
+# OVERWRITE table
+dbWriteTable(
+  con,
+  Id(schema = schema_name, table = table_name),
+  reddit_geotagged,
+  overwrite = TRUE
+)
+
+# verify
+dbGetQuery(con, sprintf("SELECT COUNT(*) AS n FROM %s.%s", schema_name, table_name))
+```
+
+```{r}
+# close connection
+dbDisconnect(con)
+```

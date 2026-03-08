@@ -18,12 +18,13 @@ Details:
 Run Examples:
   # 50 newest posts from r/travel + all nested comments (as returned in the initial comments JSON)
   python reddit_scrape.py \
-    --subs travel \
-    --sort new \
-    --post_limit 50 \
+    --subs TravelHacks shoestring wanderlust solotravel \
+    --sort top \
+    --post_limit 100 \
+    --max_comments_per_post 150 \
     --min_sleep 4 --max_sleep 7 \
-    --posts_out ../out/posts/travel_posts.csv \
-    --comments_out ../out/comments/travel_50_new_with_comments.csv
+    --posts_out ../out/posts/multisub_feb_5.csv \
+    --comments_out ../out/comments/multisub_feb_5.csv
 
   # Multiple subs, fewer posts, cap comments per post to avoid huge outputs
   python reddit_scrape.py \
@@ -34,9 +35,19 @@ Run Examples:
     --min_sleep 3 --max_sleep 7 \
     --posts_out ../out/posts/posts.csv \
     --comments_out ../out/comments/comments.csv
-
+    
+Run Example:
+  # Skip 300 newest posts, then collect 200 older posts from r/travel
+  python reddit_scrape.py \
+    --subs travel \
+    --sort new \
+    --skip_posts 300 \
+    --post_limit 200 \
+    --max_comments_per_post 150 \
+    --min_sleep 4 --max_sleep 7 \
+    --posts_out ../out/posts/travel_older.csv \
+    --comments_out ../out/comments/travel_older.csv
 """
-
 
 from __future__ import annotations
 
@@ -66,7 +77,7 @@ class RedditPost:
     fullname: str
     title: str
     author: Optional[str]
-    created_utc: Optional[str] 
+    created_utc: Optional[str]
     score: Optional[int]
     num_comments: Optional[int]
     upvote_ratio: Optional[float]
@@ -87,7 +98,7 @@ class RedditComment:
     parent_fullname: Optional[str]
     depth: int
     author: Optional[str]
-    created_utc: Optional[str]   
+    created_utc: Optional[str]
     score: Optional[int]
     body: Optional[str]
     permalink: str
@@ -152,10 +163,15 @@ def scrape_posts_json(
     sort: str,
     t: str,
     post_limit: int,
+    skip_posts: int,
     min_sleep: float,
     max_sleep: float,
     timeout: int,
 ) -> List[RedditPost]:
+    """
+    Collects up to post_limit posts AFTER skipping skip_posts posts (based on listing order).
+    Skipping is per subreddit, and applied before adding rows to output.
+    """
     rows: List[RedditPost] = []
     seen_ids: set[str] = set()
 
@@ -163,10 +179,12 @@ def scrape_posts_json(
     count = 0
     page = 0
 
+    skipped = 0  # how many we've skipped so far (per subreddit)
+
     while len(rows) < post_limit:
         page += 1
         url = listing_url(sub, sort, t, after, count)
-        print(f"  posts page {page}: after={after or 'None'}")
+        print(f"  posts page {page}: after={after or 'None'} (skipped {skipped}/{skip_posts}, kept {len(rows)}/{post_limit})")
 
         resp = session.get(url, timeout=timeout, allow_redirects=True)
         if resp.status_code in (403, 429):
@@ -190,6 +208,11 @@ def scrape_posts_json(
             if not post_id or post_id in seen_ids:
                 continue
             seen_ids.add(post_id)
+
+            # Skip newest posts first (based on listing order)
+            if skipped < skip_posts:
+                skipped += 1
+                continue
 
             fullname = d.get("name")  # t3_xxx
             permalink = d.get("permalink") or ""
@@ -266,14 +289,12 @@ def flatten_comment_tree(
         data = (node or {}).get("data") or {}
 
         if kind == "more":
-            # Placeholder for additional comments not included in this payload.
             skipped_more += 1
             continue
 
         if kind != "t1":
             continue
 
-        # Depth cap
         if depth > max_depth:
             continue
 
@@ -284,7 +305,6 @@ def flatten_comment_tree(
 
         body = data.get("body")
         removed = False
-        # Sometimes removed/deleted comments have body like "[removed]" / "[deleted]" or empty
         if body in ("[removed]", "[deleted]") or body is None:
             removed = True
 
@@ -312,12 +332,10 @@ def flatten_comment_tree(
             )
         )
 
-        # Push replies (if any) onto the stack
         replies = data.get("replies")
         if replies and isinstance(replies, dict):
             rep_data = (replies.get("data") or {})
             rep_children = rep_data.get("children") or []
-            # Depth increases by 1 for replies
             next_depth = depth + 1
             if next_depth <= max_depth:
                 for rep in reversed(rep_children):
@@ -350,7 +368,6 @@ def scrape_comments_json(
     if not isinstance(payload, list) or len(payload) < 2:
         return [], 0
 
-    # payload[1] is the comment listing
     listing = payload[1] or {}
     data = (listing.get("data") or {})
     children = data.get("children") or []
@@ -389,10 +406,22 @@ def main() -> None:
     ap.add_argument("--subs", nargs="+", required=True, help="Subreddits (no r/), e.g. travel solotravel")
     ap.add_argument("--sort", default="new", choices=["new", "hot", "top"], help="Post listing sort")
     ap.add_argument("--t", default="week", choices=["hour", "day", "week", "month", "year", "all"], help="Time window for top")
-    ap.add_argument("--post_limit", type=int, default=25, help="Posts per subreddit")
-    ap.add_argument("--comment_sort", default="top",
-                    choices=["confidence", "top", "new", "controversial", "old", "qa"],
-                    help="Comment sort used by /comments/{id}.json")
+    ap.add_argument("--post_limit", type=int, default=25, help="Posts PER subreddit to collect (after skipping).")
+
+    # NEW:
+    ap.add_argument(
+        "--skip_posts",
+        type=int,
+        default=0,
+        help="Skip the N most recent posts PER subreddit before collecting posts (applies to listing order).",
+    )
+
+    ap.add_argument(
+        "--comment_sort",
+        default="top",
+        choices=["confidence", "top", "new", "controversial", "old", "qa"],
+        help="Comment sort used by /comments/{id}.json",
+    )
     ap.add_argument("--max_comments_per_post", type=int, default=2000,
                     help="Hard cap on flattened comments per post (safety)")
     ap.add_argument("--max_depth", type=int, default=50,
@@ -410,7 +439,6 @@ def main() -> None:
     all_posts: List[RedditPost] = []
     all_comments: List[RedditComment] = []
 
-    # scrape posts per sub
     for sub in args.subs:
         print(f"\n== r/{sub} ==")
         posts = scrape_posts_json(
@@ -419,14 +447,14 @@ def main() -> None:
             sort=args.sort,
             t=args.t,
             post_limit=args.post_limit,
+            skip_posts=args.skip_posts,
             min_sleep=args.min_sleep,
             max_sleep=args.max_sleep,
             timeout=args.timeout,
         )
-        print(f"  collected {len(posts)} posts from r/{sub}")
+        print(f"  collected {len(posts)} posts from r/{sub} (after skipping {args.skip_posts})")
         all_posts.extend(posts)
 
-        # scrape comments for each post
         skipped_more_total = 0
         for i, post in enumerate(posts, start=1):
             print(f"  comments {i}/{len(posts)} for post {post.post_id}")
@@ -453,7 +481,6 @@ def main() -> None:
 
     comment_dedup: Dict[str, RedditComment] = {}
     for c in all_comments:
-        # fullname is unique across reddit
         comment_dedup[c.fullname] = c
     all_comments = list(comment_dedup.values())
 

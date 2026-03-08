@@ -1,0 +1,291 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages and libraries
+
+Install necessary libraries 
+
+```{r}
+# readRenviron("~/.Renviron")
+
+# libraries
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(readr)
+library(stringr)
+library(purrr)
+library(lubridate)
+library(ggplot2)
+
+```
+
+## Connect
+
+Connect to Postgres
+
+```{r}
+
+# connect to postgres
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = Sys.getenv("DB_HOST"),
+  port = as.integer(Sys.getenv("DB_PORT", "5432")),
+  dbname = Sys.getenv("DB_NAME"),
+  user = Sys.getenv("DB_USER"),
+  password = Sys.getenv("DB_PASS"),
+  sslmode = "require"
+)
+
+# which postgres table
+schema_name <- "clean_data"
+table_name  <- "reddit"
+
+```
+
+Get postgres data:
+
+```{r}
+# read in data
+reddit <- dbGetQuery(con, "SELECT * FROM clean_data.reddit") # WHERE scraped_timestamp >= NOW() - interval '30 days'")
+```
+
+Get CSV data:
+```{r}
+# CSV directory
+csv_dir <- "reddit_data/"
+
+cutoff_date <- as.POSIXct("2024-01-01 00:00:00", tz = "UTC") #cut off date set to Jan 1, 2024
+```
+
+# helper functions
+```{r}
+read_any_csv <- function(path) {
+  read_csv(path, col_types = cols(.default = col_character()), progress = FALSE) %>%
+    mutate(source_file = basename(path))
+}
+
+parse_utc <- function(x) {
+  # Handles strings like "2025-06-13T14:38:14+00:00" or "2026-02-28T21:46:42Z"
+  suppressWarnings(ymd_hms(x, tz = "UTC"))
+}
+```
+
+# Load all csv files
+```{r}
+all_files <- list.files(csv_dir, pattern = "\\.csv$", full.names = TRUE)
+
+comment_files <- all_files[str_detect(tolower(all_files), "comments")]
+post_files    <- setdiff(all_files, comment_files)
+
+posts <- map_dfr(post_files, read_any_csv)
+comments <- map_dfr(comment_files, read_any_csv)
+```
+
+```{r}
+# transform the csv files
+reddit_cols <- names(reddit)
+
+# helper: take a df and force it to have exactly reddit's columns (missing -> NA, extras dropped)
+to_reddit_schema <- function(df, reddit_cols) {
+  # add any missing columns as NA
+  missing <- setdiff(reddit_cols, names(df))
+  if (length(missing) > 0) df[missing] <- NA
+
+  # drop extras + enforce column order
+  df <- df[, reddit_cols, drop = FALSE]
+  df
+}
+
+# helper: get first existing column name from a set of candidates
+pick_col <- function(df, candidates) {
+  hit <- intersect(candidates, names(df))
+  if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+# ---- Identify actual column names in raw posts/comments ----
+post_created_col <- pick_col(posts, c("post_created_at_utc", "created_utc", "created", "createdAt", "created_at"))
+post_author_col  <- pick_col(posts, c("author_post", "author", "post_author"))
+post_title_col   <- pick_col(posts, c("title"))
+post_self_col    <- pick_col(posts, c("self_text", "selftext", "selfText", "self"))
+post_flair_col   <- pick_col(posts, c("link_flair_text", "link_flair", "flair"))
+post_score_col   <- pick_col(posts, c("score_post", "score"))
+post_upvote_col  <- pick_col(posts, c("upvote_ratio", "upvoteRatio"))
+post_ncom_col    <- pick_col(posts, c("num_comments", "numComments", "comments"))
+post_url_col     <- pick_col(posts, c("post_url", "url", "permalink", "link"))
+
+comment_created_col <- pick_col(comments, c("comment_created_at_utc", "created_utc", "created", "createdAt", "created_at"))
+comment_author_col  <- pick_col(comments, c("author_comment", "author"))
+comment_body_col    <- pick_col(comments, c("body", "comment", "text"))
+comment_score_col   <- pick_col(comments, c("score_comment", "score"))
+
+
+# (post fields populated, comment fields NA)
+posts_as_reddit <- posts %>%
+  transmute(
+    subreddit = subreddit,
+
+    comment_created_at_utc = as.POSIXct(NA, tz = "UTC"),
+    author_comment = NA_character_,
+    body = NA_character_,
+    score_comment = as.numeric(NA),
+
+    post_created_at_utc = if (!is.na(post_created_col)) .data[[post_created_col]] else NA,
+    author_post        = if (!is.na(post_author_col))  .data[[post_author_col]]  else NA,
+    title              = if (!is.na(post_title_col))   .data[[post_title_col]]   else NA,
+    self_text          = if (!is.na(post_self_col))    .data[[post_self_col]]    else NA,
+    link_flair_text    = if (!is.na(post_flair_col))   .data[[post_flair_col]]   else NA,
+    score_post         = if (!is.na(post_score_col))   .data[[post_score_col]]   else NA,
+    upvote_ratio       = if (!is.na(post_upvote_col))  .data[[post_upvote_col]]  else NA,
+    num_comments       = if (!is.na(post_ncom_col))    .data[[post_ncom_col]]    else NA,
+    post_url           = if (!is.na(post_url_col))     .data[[post_url_col]]     else NA,
+
+    full_text = NA_character_,
+    countries_mentioned = NA_character_,
+    cities_mentioned = NA_character_,
+    countries_iso3 = NA_character_
+  ) %>%
+  mutate(
+    post_created_at_utc = ymd_hms(post_created_at_utc, tz = "UTC", quiet = TRUE),
+    score_post   = suppressWarnings(as.numeric(score_post)),
+    upvote_ratio = suppressWarnings(as.numeric(upvote_ratio)),
+    num_comments = suppressWarnings(as.numeric(num_comments))
+  ) %>%
+  to_reddit_schema(reddit_cols)
+
+# turn comments into reddit table-shaped rows
+comments_as_reddit <- comments %>%
+  transmute(
+    subreddit = subreddit,
+
+    comment_created_at_utc = if (!is.na(comment_created_col)) .data[[comment_created_col]] else NA,
+    author_comment         = if (!is.na(comment_author_col))  .data[[comment_author_col]]  else NA,
+    body                   = if (!is.na(comment_body_col))    .data[[comment_body_col]]    else NA,
+    score_comment          = if (!is.na(comment_score_col))   .data[[comment_score_col]]   else NA,
+
+    post_created_at_utc = as.POSIXct(NA, tz = "UTC"),
+    author_post = NA_character_,
+    title = NA_character_,
+    self_text = NA_character_,
+    link_flair_text = NA_character_,
+    score_post = as.numeric(NA),
+    upvote_ratio = as.numeric(NA),
+    num_comments = as.numeric(NA),
+    post_url = NA_character_,
+
+    full_text = NA_character_,
+    countries_mentioned = NA_character_,
+    cities_mentioned = NA_character_,
+    countries_iso3 = NA_character_
+  ) %>%
+  mutate(
+    comment_created_at_utc = ymd_hms(comment_created_at_utc, tz = "UTC", quiet = TRUE),
+    score_comment = suppressWarnings(as.numeric(score_comment))
+  ) %>%
+  to_reddit_schema(reddit_cols)
+
+```
+
+# Join into master
+
+```{r}
+# append the new data
+
+reddit2 <- bind_rows(reddit, posts_as_reddit, comments_as_reddit) %>%
+  mutate(
+    subreddit = tolower(trimws(subreddit)),
+    row_dt = coalesce(post_created_at_utc, comment_created_at_utc)
+  ) %>%
+  filter(is.na(row_dt) | row_dt >= cutoff_date) %>%
+  select(-row_dt) %>%
+  distinct(across(everything()), .keep_all = TRUE)
+
+# handle casing difference
+reddit2 <- reddit2 %>%
+  mutate(subreddit = tolower(trimws(subreddit)))
+
+```
+
+```{r}
+# Narrow down to before cut-off date
+reddit2 <- reddit2 %>%
+  mutate(row_dt = coalesce(post_created_at_utc, comment_created_at_utc)) %>%
+  filter(is.na(row_dt) | row_dt >= cutoff_date) %>%
+  select(-row_dt)
+
+# remove duplicates
+reddit2 <- reddit2 %>% distinct(across(everything()), .keep_all = TRUE)
+
+# remove blank subreddit
+reddit2 <- reddit2 %>%
+  filter(!is.na(subreddit) & subreddit != "")
+
+```
+
+# Plot what I currently have (date by subreddit)
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(viridis)
+
+plot_df <- reddit2 %>%
+  mutate(date = as.Date(post_created_at_utc)) %>%
+  distinct(subreddit, date) %>%                 # one point per subreddit per day
+  arrange(subreddit, date)
+
+ggplot(plot_df, aes(x = date, y = subreddit, color = subreddit)) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  labs(
+    title = "Reddit Post Coverage by Subreddit",
+    x = "Date",
+    y = NULL
+  ) +
+  scale_y_discrete(expand = expansion(add = 0.8)) +
+  scale_color_viridis_d(option = "turbo") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    legend.position = "none",
+    plot.margin = margin(20, 20, 20, 20)
+  )
+```
+
+# Push data to postgres
+
+```{r mongo-query}
+con <- dbConnect(
+  RPostgres::Postgres(),
+  host = Sys.getenv("DB_HOST"),
+  port = as.integer(Sys.getenv("DB_PORT", "5432")),
+  dbname = Sys.getenv("DB_NAME"),
+  user = Sys.getenv("DB_USER"),
+  password = Sys.getenv("DB_PASS"),
+  sslmode = "require"
+)
+
+# verify
+dbGetQuery(con, "select now() as now_utc;")
+```
+
+``` {r}
+schema_name <- "clean_data"
+table_name  <- "reddit"    
+
+# OVERWRITE table
+dbWriteTable(
+  con,
+  Id(schema = schema_name, table = table_name),
+  reddit2,
+  overwrite = TRUE
+)
+
+# verify
+dbGetQuery(con, sprintf("SELECT COUNT(*) AS n FROM %s.%s", schema_name, table_name))
+```
+
+```{r}
+# close connection
+dbDisconnect(con)
+```
